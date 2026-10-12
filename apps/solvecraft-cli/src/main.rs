@@ -322,7 +322,13 @@ fn cmd_mcp(args: &[String]) -> Result<(), String> {
         (Some(_), Some(_)) => return Err("mcp: use either --connect or --in, not both".into()),
         (Some(addr), None) => Box::new(solvecraft_mcp::Remote::connect(addr).map_err(|e| format!("cannot connect to {addr}: {e}"))?),
         (None, Some(path)) => Box::new(solvecraft_mcp::Headless::new(load(path)?)),
-        (None, None) => Box::new(solvecraft_mcp::Headless::default()),
+        (None, None) => {
+            if let Ok(remote) = solvecraft_mcp::Remote::connect("127.0.0.1:27182") {
+                Box::new(remote)
+            } else {
+                Box::new(solvecraft_mcp::Headless::default())
+            }
+        }
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
