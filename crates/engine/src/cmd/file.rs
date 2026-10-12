@@ -37,6 +37,10 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .params("path; format?: stl|stla|obj|step|3mf (default from extension); bodies?: [names]"),
     CommandSpec::new("file.save_mesh", "Save As Mesh", save_stl).icon("export").noundo().params("path; bodies?: [names]; ascii?: bool"),
+    CommandSpec::new("mesh.to_brep", "Convert Mesh to B-Rep", mesh_to_brep)
+        .at("SOLID", "CREATE")
+        .icon("convert")
+        .params("body?: string; path?: string; out?: string; max_angle_deg?: number; max_dist_mm?: number; collinear_tol_mm?: number; add_to_doc?: bool"),
 ];
 
 fn new_doc(s: &mut Session, p: &Value) -> Result<Value> {
@@ -219,3 +223,105 @@ fn recovery_discard(_s: &mut Session, p: &Value) -> Result<Value> {
     }
     Ok(json!({"discarded": ids}))
 }
+
+fn mesh_to_brep(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "mesh.to_brep";
+    let body_name = str_(p, "body");
+    let in_path = str_(p, "path");
+    let out_step = str_(p, "out");
+    let max_angle = crate::params::num(p, "max_angle_deg").unwrap_or(8.0);
+    let max_dist = crate::params::num(p, "max_dist_mm").unwrap_or(0.05);
+    let collinear_tol = crate::params::num(p, "collinear_tol_mm").unwrap_or(0.02);
+
+    let params = solvecraft_kernel::mesh_to_brep::FeatureParams {
+        max_planar_angle_rad: max_angle.to_radians(),
+        max_plane_dist_mm: max_dist,
+        collinear_tol_mm: collinear_tol,
+        min_region_triangles: 1,
+    };
+
+    let (mesh_name, tri_mesh) = if let Some(path) = in_path {
+        let bytes = solvecraft_io::vfs::read(path, solvecraft_io::MAX_3MF_BYTES)
+            .map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let mf = solvecraft_io::mesh_import_feature(&bytes, path)
+            .map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let solvecraft_doc::FeatureKind::MeshImport { meshes, .. } = &mf.kind else {
+            return Err(bad(cmd, "failed to read mesh data from file"));
+        };
+        let m = meshes.first().ok_or_else(|| bad(cmd, "mesh file contains no mesh"))?;
+        let positions: Vec<solvecraft_geom::Vec3> = m.positions.as_chunks::<3>().0.iter().map(|c| solvecraft_geom::Vec3::new(c[0], c[1], c[2])).collect();
+        let triangles: Vec<[u32; 3]> = m.triangles.as_chunks::<3>().0.to_vec();
+        let body = solvecraft_kernel::mesh_body(&positions, &triangles)
+            .map_err(|e| EngineError::Other(format!("invalid mesh: {e}")))?;
+        let (pos, tri) = body.triangle_mesh().ok_or_else(|| bad(cmd, "empty mesh"))?;
+        (mf.name, solvecraft_kernel::mesh_to_brep::TriMesh {
+            positions: pos.to_vec(),
+            triangles: tri.to_vec(),
+        })
+    } else {
+        let st = s.model.state();
+        let b = if let Some(name) = body_name {
+            st.bodies.iter().find(|b| b.name == name)
+                .ok_or_else(|| bad(cmd, format!("body `{name}` not found")))?
+        } else {
+            st.bodies.iter().find(|b| b.body.is_mesh())
+                .ok_or_else(|| bad(cmd, "no mesh body found in design; provide `body` or `path`"))?
+        };
+        let (pos, tri) = b.body.triangle_mesh()
+            .ok_or_else(|| bad(cmd, format!("body `{}` is a solid, not a mesh", b.name)))?;
+        (b.name.clone(), solvecraft_kernel::mesh_to_brep::TriMesh {
+            positions: pos.to_vec(),
+            triangles: tri.to_vec(),
+        })
+    };
+
+    let surfaces = solvecraft_kernel::mesh_to_brep::segment_mesh(&tri_mesh, params);
+    let mut planar_count = 0;
+    let mut cylinder_count = 0;
+    let mut unstructured_count = 0;
+    for s_surf in &surfaces {
+        match s_surf {
+            solvecraft_kernel::mesh_to_brep::RecognizedSurface::Planar { .. } => planar_count += 1,
+            solvecraft_kernel::mesh_to_brep::RecognizedSurface::Cylindrical { .. } => cylinder_count += 1,
+            solvecraft_kernel::mesh_to_brep::RecognizedSurface::Unstructured { .. } => unstructured_count += 1,
+        }
+    }
+
+    let brep_solid = solvecraft_kernel::mesh_to_brep::mesh_to_brep_solid(&tri_mesh, params)
+        .map_err(|e| EngineError::Other(format!("B-Rep reconstruction failed: {e}")))?;
+
+    let step_text = solvecraft_kernel::step_export(&[&brep_solid], "SolidCraft")
+        .map_err(|e| EngineError::Other(format!("STEP export failed: {e}")))?;
+
+    if let Some(out_p) = out_step {
+        solvecraft_io::vfs::write(out_p, step_text.as_bytes())
+            .map_err(|e| EngineError::Other(format!("{out_p}: {e}")))?;
+    }
+
+    let add_to_doc = bool_(p, "add_to_doc").unwrap_or(out_step.is_none() || in_path.is_none());
+    let mut feature_id = None;
+    if add_to_doc {
+        let f_name = format!("{mesh_name}_brep");
+        let fid = s.doc_mut().add_feature(
+            solvecraft_doc::FeatureKind::Import {
+                file: format!("{f_name}.step"),
+                step: step_text.clone(),
+                components: Vec::new(),
+            },
+            Some(&f_name),
+        )?;
+        s.refresh();
+        feature_id = Some(fid);
+    }
+
+    Ok(json!({
+        "name": mesh_name,
+        "planar_faces": planar_count,
+        "cylinders": cylinder_count,
+        "unstructured": unstructured_count,
+        "feature": feature_id,
+        "out": out_step,
+        "step_bytes": step_text.len(),
+    }))
+}
+

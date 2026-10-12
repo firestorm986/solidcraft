@@ -34,6 +34,7 @@ mod lip;
 mod loopblend;
 mod measure;
 mod meshbody;
+pub mod mesh_to_brep;
 mod offset;
 mod ops;
 mod polybool;

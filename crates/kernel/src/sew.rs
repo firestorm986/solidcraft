@@ -350,6 +350,30 @@ fn split_vertex_fans(faces: Vec<mt::Face>) -> Result<Vec<mt::Face>> {
         .collect()
 }
 
+fn fit_plane_from_points(pts: &[Vec3]) -> Option<mt::Plane> {
+    if pts.len() < 3 {
+        return None;
+    }
+    let center = pts.iter().fold(Vec3::ZERO, |sum, p| sum + *p) / pts.len() as f64;
+    let mut normal = Vec3::ZERO;
+    let n = pts.len();
+    for i in 0..n {
+        let curr = pts[i];
+        let next = pts[(i + 1) % n];
+        normal.x += (curr.y - next.y) * (curr.z + next.z);
+        normal.y += (curr.z - next.z) * (curr.x + next.x);
+        normal.z += (curr.x - next.x) * (curr.y + next.y);
+    }
+    let n_unit = normal.normalized()?;
+    let u_dir = if n_unit.z.abs() < 0.9 {
+        n_unit.cross(Vec3::Z).normalized()?
+    } else {
+        n_unit.cross(Vec3::X).normalized()?
+    };
+    let v_dir = n_unit.cross(u_dir).normalized()?;
+    Some(mt::Plane::new(p3(center), p3(center + u_dir), p3(center + v_dir)))
+}
+
 fn sew_impl(faces: &[FaceSpec], touching: bool, sources: Option<&[Option<crate::FaceSource>]>) -> Result<Body> {
     if faces.len() < 4 || faces.len() > 200_000 {
         return Err(KernelError::Invalid("a solid needs 4…200000 faces".into()));
@@ -383,7 +407,14 @@ fn sew_impl(faces: &[FaceSpec], touching: bool, sources: Option<&[Option<crate::
                 })
                 .collect();
             let face = match f.surface {
-                SurfSpec::Plane => builder::try_attach_plane(&wires).map_err(|e| KernelError::Failed(format!("sew: face {fi}: {e}")))?,
+                SurfSpec::Plane => match builder::try_attach_plane(&wires) {
+                    Ok(face) => face,
+                    Err(_) => {
+                        let pts: Vec<Vec3> = f.loops.iter().flat_map(|l| l.iter().map(|e| e.ends().0)).collect();
+                        let plane = fit_plane_from_points(&pts).ok_or_else(|| KernelError::Failed(format!("sew: face {fi}: cannot fit plane")))?;
+                        mt::Face::try_new(wires, mt::Surface::Plane(plane)).map_err(|e| KernelError::Failed(format!("sew: face {fi}: {e}")))?
+                    }
+                },
                 SurfSpec::Revolved { a, b, axis_origin, axis, angle } => {
                     let k = axis.normalized().ok_or_else(|| KernelError::Invalid("sew: axis".into()))?;
                     let (va, vb) = (builder::vertex(p3(a)), builder::vertex(p3(b)));

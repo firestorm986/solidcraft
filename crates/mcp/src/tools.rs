@@ -210,6 +210,27 @@ pub fn tool_definitions() -> Vec<Value> {
             false,
             false,
         ),
+        tool(
+            "stl_to_step",
+            "Convert STL mesh to STEP CAD B-Rep",
+            "Intelligently convert a 3D triangle mesh (STL or 3MF) or an existing mesh body in the design into a clean analytic B-Rep CAD model (STEP). \
+             Recognizes flat planar regions and fits planes, detects cylindrical holes and curved surfaces, simplifies collinear edges, \
+             and reconstructs a closed watertight B-Rep solid. Can export directly to a .step file and/or add to the current design as an Import feature.",
+            obj(
+                json!({
+                    "path": string("Input mesh file path (.stl or .3mf). If omitted, converts a mesh body from the current design."),
+                    "body": string("Mesh body name in the current design (if converting an active mesh body)."),
+                    "out": string("Output .step file destination path."),
+                    "max_angle_deg": {"type": "number", "description": "Max normal angle in degrees to cluster into planar faces (default 8.0)"},
+                    "max_dist_mm": {"type": "number", "description": "Max distance in mm from fitted plane (default 0.05)"},
+                    "collinear_tol_mm": {"type": "number", "description": "Tolerance in mm for simplifying collinear edges (default 0.02)"},
+                    "add_to_doc": {"type": "boolean", "description": "Whether to add the converted B-Rep body to the active design timeline (default true)"},
+                }),
+                &[],
+            ),
+            false,
+            false,
+        ),
     ]
 }
 
@@ -357,6 +378,7 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
         "new_design" => exec(b, "file.new", pick(a, &["name"])),
         "open" => exec(b, "doc.open", pick(a, &["path"])),
         "save" => exec(b, "file.save", pick(a, &["path"])),
+        "stl_to_step" => exec(b, "mesh.to_brep", pick(a, &["path", "body", "out", "max_angle_deg", "max_dist_mm", "collinear_tol_mm", "add_to_doc"])),
         other => Err(format!("unknown tool `{other}`")),
     }
 }

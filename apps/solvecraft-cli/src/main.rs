@@ -43,6 +43,7 @@ const USAGE: &str = "usage:
   solvecraft-cli oracle <case-dir>... [--json]
   solvecraft-cli fuzz [--from N] [--count N] [--jobs J] [--timeout S] [--steps N] [--minimise] [--out DIR] [--report FILE]
   solvecraft-cli step-corpus <case-dir>... [--json] [--iges]
+  solvecraft-cli stl-to-step <input.stl> [--out <output.step>] [--angle DEG] [--dist MM] [--tol MM]
   solvecraft-cli mcp [--in design.solvecraft|script.json] [--connect 127.0.0.1:PORT]
   solvecraft-cli licences
   solvecraft-cli icon --out icon.png [--size 256] | --out icon.ico
@@ -55,6 +56,7 @@ fn main() -> ExitCode {
         Some("eval" | "inspect") => cmd_eval(&args[1..]),
         Some("snapshot") => cmd_snapshot(&args[1..]),
         Some("exec") => cmd_exec(&args[1..]),
+        Some("stl-to-step") => cmd_stl_to_step(&args[1..]),
         Some("commands") => {
             use std::io::Write as _;
             let mut s = Session::default();
@@ -281,6 +283,35 @@ fn cmd_exec(args: &[String]) -> Result<(), String> {
     let mut s = Session::default();
     let v = s.execute(id, &p).map_err(|e| e.to_string())?;
     println!("{}", pretty(&v));
+    Ok(())
+}
+
+fn cmd_stl_to_step(args: &[String]) -> Result<(), String> {
+    let input = args.iter().find(|a| !a.starts_with('-')).ok_or_else(|| {
+        "usage: solvecraft-cli stl-to-step <input.stl> [--out <output.step>] [--angle DEG] [--dist MM] [--tol MM]".to_string()
+    })?;
+    let out_step = flag(args, "--out").or_else(|| flag(args, "-o")).map(|s| s.to_string()).unwrap_or_else(|| {
+        let p = std::path::Path::new(input);
+        p.with_extension("step").to_string_lossy().to_string()
+    });
+    let max_angle = flag(args, "--angle").and_then(|s| s.parse::<f64>().ok()).unwrap_or(8.0);
+    let max_dist = flag(args, "--dist").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.05);
+    let collinear_tol = flag(args, "--tol").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.02);
+
+    let mut s = Session::default();
+    let res = s.execute(
+        "mesh.to_brep",
+        &json!({
+            "path": input,
+            "out": out_step,
+            "max_angle_deg": max_angle,
+            "max_dist_mm": max_dist,
+            "collinear_tol_mm": collinear_tol,
+            "add_to_doc": false,
+        }),
+    ).map_err(|e| e.to_string())?;
+
+    println!("{}", pretty(&res));
     Ok(())
 }
 
