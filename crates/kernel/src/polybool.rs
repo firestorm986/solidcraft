@@ -380,6 +380,13 @@ pub fn planar_boolean(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
             if let Some(r) = sliced_planar_boolean(a, b, op) {
                 return r;
             }
+            let size = a.size().max(b.size());
+            let facet_tol = (size * 1e-3).max(1e-3);
+            if let Ok(mb) = b.tessellate(facet_tol) {
+                if let Ok(Some(body)) = faceted_boolean(a, &mb, op, facet_tol) {
+                    return Ok(Some(body));
+                }
+            }
             let why: Vec<String> =
                 [(ra.err(), "target"), (rb.err(), "tool")].into_iter().filter_map(|(e, role)| e.map(|e| e.describe(role))).collect();
             return Err(KernelError::Failed(format!(
