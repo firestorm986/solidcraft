@@ -358,6 +358,11 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
         let face = sel.iter().find_map(|s| if let Sel::Face { body, .. } = s { Some(body.clone()) } else { None }).unwrap_or_default();
         let (feature, sketch) = body_feature_and_sketch(app, &face);
         let hidden = app.session.visibility.hidden_bodies.contains(&face);
+        let is_mesh = app.session.world_state().body(&face).is_some_and(|b| b.body.is_mesh());
+        if is_mesh {
+            v.push(cmd(app, "mesh.to_brep", "Convert Mesh to Solid (B-Rep)").with(json!({ "body": face })));
+            v.push(Item::sep());
+        }
         v.push(cmd(app, "sketch.create", "Create Sketch"));
         v.push(cmd(app, "solid.extrude", "Extrude"));
         v.push(cmd(app, "construct.plane.offset", "Offset Plane"));
@@ -430,10 +435,16 @@ fn body_items(app: &SolveApp, bodies: &[String], browser: bool) -> Vec<Item> {
     let all_hidden = bodies.iter().all(|b| app.session.visibility.hidden_bodies.contains(b));
     let one = bodies.len() == 1;
     let locked = bodies.iter().all(|b| app.ui.locked_bodies.contains(b));
+    let any_mesh = bodies.iter().any(|b| app.session.world_state().body(b).is_some_and(|mb| mb.body.is_mesh()));
     let items = json!(bodies.iter().map(|b| json!({"type": "body", "name": b})).collect::<Vec<_>>());
     let mut v = vec![
         act("ui.moveBodies", "Move/Copy", "move").key("M").with(json!({ "bodies": names })).on(!locked),
         cmd(app, "component.from_bodies", "Create Components from Bodies").with(json!({ "bodies": names })),
+    ];
+    if any_mesh {
+        v.push(cmd(app, "mesh.to_brep", "Convert Mesh to Solid (B-Rep)").with(json!({ "body": bodies.first() })));
+    }
+    v.extend([
         Item::sep(),
         act("ui.material", "Physical Material", "").with(json!({ "bodies": names })),
         act("ui.appearance", "Appearance", "appearance").key("A").with(json!({ "bodies": names })),
@@ -449,7 +460,7 @@ fn body_items(app: &SolveApp, bodies: &[String], browser: bool) -> Vec<Item> {
         act(if all_hidden { "ui.show" } else { "ui.hide" }, "Show/Hide", "eye").key("V").with(json!({ "bodies": names })),
         act("ui.lock", if locked { "Unlock" } else { "Lock" }, "").with(json!({ "bodies": names })),
         act("ui.isolate", "Isolate", "").with(json!({ "bodies": names })),
-    ];
+    ]);
     if one {
         let b = bodies.first().cloned().unwrap_or_default();
         v.push(Item::sep());

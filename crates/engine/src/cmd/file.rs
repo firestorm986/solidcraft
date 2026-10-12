@@ -240,6 +240,7 @@ fn mesh_to_brep(s: &mut Session, p: &Value) -> Result<Value> {
         min_region_triangles: 1,
     };
 
+    let mut source_feature = None;
     let (mesh_name, tri_mesh) = if let Some(path) = in_path {
         let bytes = solvecraft_io::vfs::read(path, solvecraft_io::MAX_3MF_BYTES)
             .map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
@@ -259,16 +260,23 @@ fn mesh_to_brep(s: &mut Session, p: &Value) -> Result<Value> {
             triangles: tri.to_vec(),
         })
     } else {
+        let selected_body = s.selection.iter().find_map(|sel| match sel {
+            crate::Sel::Body { name } => Some(name.as_str()),
+            crate::Sel::Face { body, .. } | crate::Sel::Edge { body, .. } => Some(body.as_str()),
+            _ => None,
+        });
+        let target_name = body_name.or(selected_body);
         let st = s.model.state();
-        let b = if let Some(name) = body_name {
+        let b = if let Some(name) = target_name {
             st.bodies.iter().find(|b| b.name == name)
                 .ok_or_else(|| bad(cmd, format!("body `{name}` not found")))?
         } else {
             st.bodies.iter().find(|b| b.body.is_mesh())
-                .ok_or_else(|| bad(cmd, "no mesh body found in design; provide `body` or `path`"))?
+                .ok_or_else(|| bad(cmd, "no mesh body found in design; select a mesh body or provide `body` / `path`"))?
         };
         let (pos, tri) = b.body.triangle_mesh()
             .ok_or_else(|| bad(cmd, format!("body `{}` is a solid, not a mesh", b.name)))?;
+        source_feature = Some(b.feature);
         (b.name.clone(), solvecraft_kernel::mesh_to_brep::TriMesh {
             positions: pos.to_vec(),
             triangles: tri.to_vec(),
@@ -310,6 +318,13 @@ fn mesh_to_brep(s: &mut Session, p: &Value) -> Result<Value> {
             },
             Some(&f_name),
         )?;
+        if in_path.is_none() {
+            if let Some(orig_fid) = source_feature {
+                if let Some(f) = s.doc_mut().feature_mut(orig_fid) {
+                    f.suppressed = true;
+                }
+            }
+        }
         s.refresh();
         feature_id = Some(fid);
     }

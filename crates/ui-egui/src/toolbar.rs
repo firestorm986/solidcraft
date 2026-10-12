@@ -278,6 +278,10 @@ fn file_menu(app: &mut SolveApp, ctx: &egui::Context) {
                     app.start("file.insert_mesh");
                     close = true;
                 }
+                if item(ui, "Convert Mesh to Solid (B-Rep)…", "") {
+                    let _ = app.run("mesh.to_brep", json!({}));
+                    close = true;
+                }
                 if item(ui, app.tr("ui.save"), "Ctrl+S") {
                     save(app);
                     close = true;

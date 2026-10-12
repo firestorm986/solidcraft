@@ -895,13 +895,19 @@ fn apply_op(state: &mut ModelState, f: &Feature, tools: Vec<Body>, op: Operation
     let targets: &[String] = if targets.is_empty() { &f.participants } else { targets };
     let all = targets.len() == 1 && targets.first().is_some_and(|t| t == "*");
     let target_idx: Vec<usize> = if all {
-        (0..state.bodies.len()).collect()
+        (0..state.bodies.len()).filter(|i| !state.bodies[*i].body.is_mesh()).collect()
     } else if targets.is_empty() {
-        (0..state.bodies.len()).filter(|i| state.bodies.get(*i).is_some_and(|b| b.component == f.component || b.feature == f.id)).collect()
+        (0..state.bodies.len()).filter(|i| {
+            state.bodies.get(*i).is_some_and(|b| (b.component == f.component || b.feature == f.id) && !b.body.is_mesh())
+        }).collect()
     } else {
         let mut v = Vec::new();
         for t in targets {
-            v.push(state.bodies.iter().position(|b| &b.name == t).ok_or_else(|| DocError::Unknown(format!("body `{t}`")))?);
+            let idx = state.bodies.iter().position(|b| &b.name == t).ok_or_else(|| DocError::Unknown(format!("body `{t}`")))?;
+            if state.bodies[idx].body.is_mesh() {
+                return Err(DocError::Invalid(format!("body `{t}` is a mesh; boolean operations require a solid body")));
+            }
+            v.push(idx);
         }
         v
     };
