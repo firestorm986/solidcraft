@@ -56,6 +56,11 @@ pub enum RecognizedSurface {
         radius: f64,
         triangles: Vec<u32>,
     },
+    Spherical {
+        center: Vec3,
+        radius: f64,
+        triangles: Vec<u32>,
+    },
     Unstructured {
         triangles: Vec<u32>,
     },
@@ -285,6 +290,273 @@ fn fit_cylinder(points: &[Vec3], normals: &[Vec3]) -> Option<(Vec3, Vec3, f64)> 
     Some((axis_point, axis_dir, radius))
 }
 
+/// Fit an optimal sphere to a collection of points and their normals.
+/// Returns (center, radius).
+pub fn fit_sphere(points: &[Vec3], normals: &[Vec3]) -> Option<(Vec3, f64)> {
+    if points.len() < 6 || normals.len() < 6 {
+        return None;
+    }
+    let n = points.len() as f64;
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    let mut sz = 0.0;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    let mut szz = 0.0;
+    let mut sxy = 0.0;
+    let mut sxz = 0.0;
+    let mut syz = 0.0;
+
+    let mut sr2 = 0.0;
+    let mut sx_r2 = 0.0;
+    let mut sy_r2 = 0.0;
+    let mut sz_r2 = 0.0;
+
+    for p in points {
+        let r2 = p.x * p.x + p.y * p.y + p.z * p.z;
+        sx += p.x;
+        sy += p.y;
+        sz += p.z;
+        sxx += p.x * p.x;
+        syy += p.y * p.y;
+        szz += p.z * p.z;
+        sxy += p.x * p.y;
+        sxz += p.x * p.z;
+        syz += p.y * p.z;
+
+        sr2 += r2;
+        sx_r2 += p.x * r2;
+        sy_r2 += p.y * r2;
+        sz_r2 += p.z * r2;
+    }
+
+    let mut a = [
+        [2.0 * sxx, 2.0 * sxy, 2.0 * sxz, sx, sx_r2],
+        [2.0 * sxy, 2.0 * syy, 2.0 * syz, sy, sy_r2],
+        [2.0 * sxz, 2.0 * syz, 2.0 * szz, sz, sz_r2],
+        [2.0 * sx,  2.0 * sy,  2.0 * sz,  n,  sr2],
+    ];
+
+    for i in 0..4 {
+        let mut max_row = i;
+        for k in (i + 1)..4 {
+            if a[k][i].abs() > a[max_row][i].abs() {
+                max_row = k;
+            }
+        }
+        a.swap(i, max_row);
+        let pivot = a[i][i];
+        if pivot.abs() < 1e-12 {
+            return None;
+        }
+        for j in i..5 {
+            a[i][j] /= pivot;
+        }
+        for k in 0..4 {
+            if k != i {
+                let factor = a[k][i];
+                for j in i..5 {
+                    a[k][j] -= factor * a[i][j];
+                }
+            }
+        }
+    }
+
+    let xc = a[0][4];
+    let yc = a[1][4];
+    let zc = a[2][4];
+    let k = a[3][4];
+
+    let center = Vec3::new(xc, yc, zc);
+    let r_sq = k + xc * xc + yc * yc + zc * zc;
+    if r_sq <= 0.0 {
+        return None;
+    }
+    let radius = r_sq.sqrt();
+
+    let mut sum_err = 0.0f64;
+    for p in points {
+        let err = ((*p - center).len() - radius).abs();
+        sum_err += err;
+    }
+    if sum_err / n > 0.1 {
+        return None;
+    }
+
+    let mut valid_normals = 0;
+    for (p, nrm) in points.iter().zip(normals.iter()) {
+        if let Some(radial) = (*p - center).normalized() {
+            if radial.dot(*nrm).abs() > 0.85 {
+                valid_normals += 1;
+            }
+        }
+    }
+    if (valid_normals as f64 / n) < 0.8 {
+        return None;
+    }
+
+    Some((center, radius))
+}
+
+/// Compute signed area of a 3D planar polygon along the outward normal.
+/// Positive = counter-clockwise (outer boundary), Negative = clockwise (inner hole).
+fn loop_signed_area(pts: &[Vec3], normal: Vec3) -> f64 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut area_vec = Vec3::ZERO;
+    for i in 0..n {
+        let p0 = pts[i];
+        let p1 = pts[(i + 1) % n];
+        area_vec = area_vec + p0.cross(p1);
+    }
+    0.5 * area_vec.dot(normal)
+}
+
+/// Extract clean simple boundary loops from a set of directed half-edges.
+/// Decomposes figure-8s and pinch points into separate simple cycles.
+fn extract_simple_loops(mut half_edges: HashSet<(u32, u32)>) -> Vec<Vec<u32>> {
+    let mut outgoing: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(u, v) in &half_edges {
+        outgoing.entry(u).or_default().push(v);
+    }
+
+    let mut loops = Vec::new();
+
+    while !half_edges.is_empty() {
+        let Some(&(start_u, _)) = half_edges.iter().next() else { break };
+        let mut path: Vec<u32> = vec![start_u];
+        let mut curr = start_u;
+
+        loop {
+            let mut next_v = None;
+            if let Some(nexts) = outgoing.get_mut(&curr) {
+                while let Some(cand) = nexts.pop() {
+                    if half_edges.remove(&(curr, cand)) {
+                        next_v = Some(cand);
+                        break;
+                    }
+                }
+            }
+
+            let Some(next) = next_v else {
+                break;
+            };
+
+            if let Some(pos) = path.iter().position(|&v| v == next) {
+                let cycle: Vec<u32> = path.drain(pos..).collect();
+                if cycle.len() >= 3 {
+                    loops.push(cycle);
+                }
+                if path.is_empty() {
+                    break;
+                }
+                curr = *path.last().unwrap();
+            } else {
+                path.push(next);
+                curr = next;
+            }
+        }
+    }
+
+    loops
+}
+
+/// Simplify a boundary loop by removing collinear intermediate vertices.
+/// A vertex is only removed if both adjacent faces agree (shared exclusively between 2 planar regions).
+fn simplify_planar_loop(
+    loop_verts: &[u32],
+    mesh: &TriMesh,
+    vertex_planar_regions: &HashMap<u32, HashSet<usize>>,
+    vertex_touches_non_planar: &HashSet<u32>,
+    collinear_tol_mm: f64,
+) -> Vec<u32> {
+    let n = loop_verts.len();
+    if n <= 3 {
+        return loop_verts.to_vec();
+    }
+
+    let is_anchor: Vec<bool> = (0..n).map(|i| {
+        let v = loop_verts[i];
+        if vertex_touches_non_planar.contains(&v) {
+            return true;
+        }
+        let Some(regs) = vertex_planar_regions.get(&v) else { return true };
+        if regs.len() != 2 {
+            return true;
+        }
+        let prev = loop_verts[(i + n - 1) % n];
+        let next = loop_verts[(i + 1) % n];
+        let Some(&p_prev) = mesh.positions.get(prev as usize) else { return true };
+        let Some(&p_curr) = mesh.positions.get(v as usize) else { return true };
+        let Some(&p_next) = mesh.positions.get(next as usize) else { return true };
+
+        let d1 = (p_curr - p_prev).normalized();
+        let d2 = (p_next - p_curr).normalized();
+        match (d1, d2) {
+            (Some(d1), Some(d2)) => d1.dot(d2) < 0.996,
+            _ => true,
+        }
+    }).collect();
+
+    let anchor_count = is_anchor.iter().filter(|&&b| b).count();
+    if anchor_count < 3 {
+        return loop_verts.to_vec();
+    }
+
+    let first_anchor = is_anchor.iter().position(|&b| b).unwrap();
+    let mut simplified = Vec::new();
+    let mut i = first_anchor;
+
+    for _ in 0..n {
+        let v_i = loop_verts[i];
+        if is_anchor[i] {
+            simplified.push(v_i);
+        } else {
+            let prev_anchor = *simplified.last().unwrap();
+            let mut j = (i + 1) % n;
+            while !is_anchor[j] {
+                j = (j + 1) % n;
+            }
+            let next_anchor = loop_verts[j];
+
+            let Some(&p_prev) = mesh.positions.get(prev_anchor as usize) else { simplified.push(v_i); continue; };
+            let Some(&p_curr) = mesh.positions.get(v_i as usize) else { simplified.push(v_i); continue; };
+            let Some(&p_next) = mesh.positions.get(next_anchor as usize) else { simplified.push(v_i); continue; };
+
+            let seg = p_next - p_prev;
+            let len_sq = seg.dot(seg);
+            let is_collinear = if len_sq < 1e-12 {
+                false
+            } else {
+                let t = (p_curr - p_prev).dot(seg) / len_sq;
+                if t >= 0.0 && t <= 1.0 {
+                    let proj = p_prev + seg * t;
+                    (p_curr - proj).len() <= collinear_tol_mm
+                } else {
+                    false
+                }
+            };
+
+            if !is_collinear {
+                simplified.push(v_i);
+            }
+        }
+
+        i = (i + 1) % n;
+        if i == first_anchor {
+            break;
+        }
+    }
+
+    if simplified.len() >= 3 {
+        simplified
+    } else {
+        loop_verts.to_vec()
+    }
+}
+
 /// Decimate nearly collinear points along a polyline.
 fn simplify_polyline(pts: &[Vec3], tol_mm: f64) -> Vec<Vec3> {
     if pts.len() < 3 {
@@ -407,32 +679,10 @@ pub fn segment_mesh(mesh: &TriMesh, params: FeatureParams) -> Vec<RecognizedSurf
                         }
                     }
 
-                    // Link boundary half-edges into loops
-                    let mut next_map: HashMap<u32, u32> = HashMap::new();
-                    for &(a, b) in &half_edges {
-                        next_map.insert(a, b);
-                    }
-
+                    let raw_loops = extract_simple_loops(half_edges);
                     let mut loops = Vec::new();
-                    let mut visited_verts = HashSet::new();
-
-                    for &start_v in next_map.keys() {
-                        if visited_verts.contains(&start_v) {
-                            continue;
-                        }
-                        let mut curr_v = start_v;
-                        let mut polyline = Vec::new();
-                        while let Some(&next_v) = next_map.get(&curr_v) {
-                            visited_verts.insert(curr_v);
-                            if let Some(&p) = mesh.positions.get(curr_v as usize) {
-                                polyline.push(p);
-                            }
-                            curr_v = next_v;
-                            if curr_v == start_v || polyline.len() > half_edges.len() {
-                                break;
-                            }
-                        }
-
+                    for l in raw_loops {
+                        let polyline: Vec<Vec3> = l.iter().filter_map(|&v| mesh.positions.get(v as usize).copied()).collect();
                         if polyline.len() >= 3 {
                             let simplified = simplify_polyline(&polyline, params.collinear_tol_mm);
                             loops.push(simplified);
@@ -454,7 +704,7 @@ pub fn segment_mesh(mesh: &TriMesh, params: FeatureParams) -> Vec<RecognizedSurf
         surfaces.push(RecognizedSurface::Unstructured { triangles: region_faces });
     }
 
-    // 2. Smooth curved region growing (cylinders, fillets) for remaining unassigned triangles
+    // 2. Smooth curved region growing (cylinders, spheres, fillets) for remaining unassigned triangles
     let smooth_cos_thresh = 45.0_f64.to_radians().cos();
     for seed_idx in 0..mesh.triangles.len() {
         if assigned[seed_idx] {
@@ -505,6 +755,12 @@ pub fn segment_mesh(mesh: &TriMesh, params: FeatureParams) -> Vec<RecognizedSurf
                 radius,
                 triangles: region_faces,
             });
+        } else if let Some((center, radius)) = fit_sphere(&region_pts, &region_normals) {
+            surfaces.push(RecognizedSurface::Spherical {
+                center,
+                radius,
+                triangles: region_faces,
+            });
         } else {
             surfaces.push(RecognizedSurface::Unstructured { triangles: region_faces });
         }
@@ -513,139 +769,8 @@ pub fn segment_mesh(mesh: &TriMesh, params: FeatureParams) -> Vec<RecognizedSurf
     surfaces
 }
 
-/// Convert an STL TriMesh into an analytic B-Rep Body with recognized planar faces.
-pub fn mesh_to_brep_solid(mesh: &TriMesh, params: FeatureParams) -> Result<Body> {
-    let surfaces = segment_mesh(mesh, params);
-    let graph = MeshGraph::build(mesh);
-
-    let mut planar_regions = Vec::new();
-    let mut non_planar_tris = Vec::new();
-
-    for s in &surfaces {
-        match s {
-            RecognizedSurface::Planar { plane, normal, d, triangles, .. } => {
-                planar_regions.push((*plane, *normal, *d, triangles.clone()));
-            }
-            RecognizedSurface::Cylindrical { triangles, .. } | RecognizedSurface::Unstructured { triangles } => {
-                non_planar_tris.extend(triangles.iter().copied());
-            }
-        }
-    }
-
-    let mut face_specs = Vec::new();
-
-    // 1. Process Planar Regions
-    for (_plane, _normal, _d, reg_tris) in &planar_regions {
-        let reg_set: HashSet<u32> = reg_tris.iter().copied().collect();
-        let mut half_edges: HashSet<(u32, u32)> = HashSet::new();
-
-        for &f in reg_tris {
-            if let Some(t) = mesh.triangles.get(f as usize) {
-                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                    let key = (a.min(b), a.max(b));
-                    let is_internal = graph.edge_to_faces.get(&key)
-                        .map(|adj| adj.iter().filter(|&&f_adj| reg_set.contains(&f_adj)).count() > 1)
-                        .unwrap_or(false);
-                    if !is_internal {
-                        half_edges.insert((a, b));
-                    }
-                }
-            }
-        }
-
-        // Link boundary half-edges into loops
-        let mut next_map: HashMap<u32, u32> = HashMap::new();
-        for &(a, b) in &half_edges {
-            next_map.insert(a, b);
-        }
-
-        let mut visited = HashSet::new();
-        let mut face_loops = Vec::new();
-        let mut all_loops_simple = true;
-
-        for &start_v in next_map.keys() {
-            if visited.contains(&start_v) {
-                continue;
-            }
-            let mut curr = start_v;
-            let mut polyline = Vec::new();
-            let mut loop_verts = HashSet::new();
-            while let Some(&next) = next_map.get(&curr) {
-                visited.insert(curr);
-                if !loop_verts.insert(curr) {
-                    // Vertex revisited in same loop -> non-simple wire / pinch!
-                    all_loops_simple = false;
-                    break;
-                }
-                if let Some(&p) = mesh.positions.get(curr as usize) {
-                    polyline.push(p);
-                }
-                curr = next;
-                if curr == start_v || polyline.len() > half_edges.len() {
-                    break;
-                }
-            }
-
-            if !all_loops_simple {
-                break;
-            }
-
-            if polyline.len() >= 3 {
-                let simplified = if non_planar_tris.is_empty() {
-                    simplify_polyline(&polyline, params.collinear_tol_mm)
-                } else {
-                    polyline
-                };
-
-                let n = simplified.len();
-                let mut edge_loop = Vec::with_capacity(n);
-                for i in 0..n {
-                    let a = simplified[i];
-                    let b = simplified[(i + 1) % n];
-                    edge_loop.push(crate::sew::EdgeSpec::Line { a, b });
-                }
-                face_loops.push(edge_loop);
-            }
-        }
-
-        if all_loops_simple && !face_loops.is_empty() {
-            face_specs.push(crate::sew::FaceSpec {
-                loops: face_loops,
-                surface: crate::sew::SurfSpec::Plane,
-                probe: None,
-            });
-        } else {
-            // Region has complex pinch points or self-intersections:
-            // Emit its triangles directly as simple planar faces!
-            for &f in reg_tris {
-                if let Some(t) = mesh.triangles.get(f as usize) {
-                    let (Some(&p0), Some(&p1), Some(&p2)) = (
-                        mesh.positions.get(t[0] as usize),
-                        mesh.positions.get(t[1] as usize),
-                        mesh.positions.get(t[2] as usize),
-                    ) else {
-                        continue;
-                    };
-                    if (p1 - p0).cross(p2 - p0).len() < 1e-9 {
-                        continue;
-                    }
-                    let edges = vec![
-                        crate::sew::EdgeSpec::Line { a: p0, b: p1 },
-                        crate::sew::EdgeSpec::Line { a: p1, b: p2 },
-                        crate::sew::EdgeSpec::Line { a: p2, b: p0 },
-                    ];
-                    face_specs.push(crate::sew::FaceSpec {
-                        loops: vec![edges],
-                        surface: crate::sew::SurfSpec::Plane,
-                        probe: None,
-                    });
-                }
-            }
-        }
-    }
-
-    // 2. Process Non-Planar Triangles (each triangle becomes an exact planar facet in the B-Rep)
-    for &f in &non_planar_tris {
+fn emit_triangles(tris: &[u32], mesh: &TriMesh, face_specs: &mut Vec<crate::sew::FaceSpec>) {
+    for &f in tris {
         if let Some(t) = mesh.triangles.get(f as usize) {
             let (Some(&p0), Some(&p1), Some(&p2)) = (
                 mesh.positions.get(t[0] as usize),
@@ -669,6 +794,132 @@ pub fn mesh_to_brep_solid(mesh: &TriMesh, params: FeatureParams) -> Result<Body>
             });
         }
     }
+}
+
+/// Convert an STL TriMesh into an analytic B-Rep Body with recognized planar faces.
+pub fn mesh_to_brep_solid(mesh: &TriMesh, params: FeatureParams) -> Result<Body> {
+    let surfaces = segment_mesh(mesh, params);
+    let graph = MeshGraph::build(mesh);
+
+    let mut planar_regions = Vec::new();
+    let mut non_planar_tris = Vec::new();
+
+    for s in &surfaces {
+        match s {
+            RecognizedSurface::Planar { plane, normal, d, triangles, .. } => {
+                planar_regions.push((*plane, *normal, *d, triangles.clone()));
+            }
+            RecognizedSurface::Cylindrical { triangles, .. }
+            | RecognizedSurface::Spherical { triangles, .. }
+            | RecognizedSurface::Unstructured { triangles } => {
+                non_planar_tris.extend(triangles.iter().copied());
+            }
+        }
+    }
+
+    let mut triangle_to_planar_reg: HashMap<u32, usize> = HashMap::new();
+    for (reg_i, (_, _, _, reg_tris)) in planar_regions.iter().enumerate() {
+        for &f in reg_tris {
+            triangle_to_planar_reg.insert(f, reg_i);
+        }
+    }
+
+    let mut vertex_planar_regions: HashMap<u32, HashSet<usize>> = HashMap::new();
+    let mut vertex_touches_non_planar: HashSet<u32> = HashSet::new();
+
+    for (f_idx, t) in mesh.triangles.iter().enumerate() {
+        let reg = triangle_to_planar_reg.get(&(f_idx as u32)).copied();
+        for &v in t {
+            match reg {
+                Some(r) => {
+                    vertex_planar_regions.entry(v).or_default().insert(r);
+                }
+                None => {
+                    vertex_touches_non_planar.insert(v);
+                }
+            }
+        }
+    }
+
+    let mut face_specs = Vec::new();
+
+    // 1. Process Planar Regions with synchronized boundary decimation
+    for (_plane, normal, _d, reg_tris) in &planar_regions {
+        let reg_set: HashSet<u32> = reg_tris.iter().copied().collect();
+        let mut half_edges: HashSet<(u32, u32)> = HashSet::new();
+
+        for &f in reg_tris {
+            if let Some(t) = mesh.triangles.get(f as usize) {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let key = (a.min(b), a.max(b));
+                    let is_internal = graph.edge_to_faces.get(&key)
+                        .map(|adj| adj.iter().filter(|&&f_adj| reg_set.contains(&f_adj)).count() > 1)
+                        .unwrap_or(false);
+                    if !is_internal {
+                        half_edges.insert((a, b));
+                    }
+                }
+            }
+        }
+
+        let raw_loops = extract_simple_loops(half_edges);
+        if raw_loops.is_empty() {
+            emit_triangles(reg_tris, mesh, &mut face_specs);
+            continue;
+        }
+
+        let mut simplified_loops = Vec::new();
+        for l in raw_loops {
+            let simp = simplify_planar_loop(&l, mesh, &vertex_planar_regions, &vertex_touches_non_planar, params.collinear_tol_mm);
+            if simp.len() >= 3 {
+                simplified_loops.push(simp);
+            }
+        }
+
+        if simplified_loops.is_empty() {
+            emit_triangles(reg_tris, mesh, &mut face_specs);
+            continue;
+        }
+
+        // Sort loops by polygon area descending: largest loop is the outer boundary, followed by inner holes
+        let mut loop_with_areas: Vec<(f64, Vec<Vec3>)> = Vec::new();
+        for l in simplified_loops {
+            let pts: Vec<Vec3> = l.iter().filter_map(|&vi| mesh.positions.get(vi as usize).copied()).collect();
+            if pts.len() >= 3 {
+                let area = loop_signed_area(&pts, *normal).abs();
+                loop_with_areas.push((area, pts));
+            }
+        }
+        if loop_with_areas.is_empty() {
+            emit_triangles(reg_tris, mesh, &mut face_specs);
+            continue;
+        }
+
+        loop_with_areas.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let make_edge_loop = |pts: &[Vec3]| -> Vec<crate::sew::EdgeSpec> {
+            let n = pts.len();
+            let mut edges = Vec::with_capacity(n);
+            for i in 0..n {
+                edges.push(crate::sew::EdgeSpec::Line { a: pts[i], b: pts[(i + 1) % n] });
+            }
+            edges
+        };
+
+        let mut face_loops = Vec::with_capacity(loop_with_areas.len());
+        for (_, pts) in loop_with_areas {
+            face_loops.push(make_edge_loop(&pts));
+        }
+
+        face_specs.push(crate::sew::FaceSpec {
+            loops: face_loops,
+            surface: crate::sew::SurfSpec::Plane,
+            probe: None,
+        });
+    }
+
+    // 2. Process Non-Planar Triangles (each triangle becomes an exact planar facet in the B-Rep)
+    emit_triangles(&non_planar_tris, mesh, &mut face_specs);
 
     if face_specs.is_empty() {
         return Err(KernelError::Invalid("no faces could be reconstructed from mesh".into()));
@@ -754,6 +1005,7 @@ mod tests {
             println!("  [{i}] {:?}", match s {
                 RecognizedSurface::Planar { normal, triangles, .. } => format!("Planar (n={normal:?}, tris={})", triangles.len()),
                 RecognizedSurface::Cylindrical { radius, axis_dir, triangles, .. } => format!("Cylindrical (r={radius}, axis={axis_dir:?}, tris={})", triangles.len()),
+                RecognizedSurface::Spherical { radius, center, triangles, .. } => format!("Spherical (r={radius}, center={center:?}, tris={})", triangles.len()),
                 RecognizedSurface::Unstructured { triangles } => format!("Unstructured (tris={})", triangles.len()),
             });
         }
@@ -813,13 +1065,19 @@ mod tests {
         println!("Segmented real STL K1_pad ({} triangles) in {:?}", count, elapsed);
         let planar_count = surfaces.iter().filter(|s| matches!(s, RecognizedSurface::Planar { .. })).count();
         let cyl_count = surfaces.iter().filter(|s| matches!(s, RecognizedSurface::Cylindrical { .. })).count();
+        let sph_count = surfaces.iter().filter(|s| matches!(s, RecognizedSurface::Spherical { .. })).count();
         let unstruct_count = surfaces.iter().filter(|s| matches!(s, RecognizedSurface::Unstructured { .. })).count();
 
         println!("  Planar surfaces: {planar_count}");
         println!("  Cylindrical surfaces: {cyl_count}");
+        println!("  Spherical surfaces: {sph_count}");
         println!("  Unstructured patches: {unstruct_count}");
 
         assert!(planar_count > 0, "Should recognize planar surfaces on K1_pad");
+
+        let body_res = mesh_to_brep_solid(&mesh, FeatureParams::default());
+        println!("Solid conversion result: {:?}", body_res.as_ref().map(|b| b.solid.face_iter().count()));
+        assert!(body_res.is_ok(), "Conversion of K1_pad to B-Rep solid should succeed");
     }
 
     #[test]
@@ -910,5 +1168,31 @@ mod tests {
 
         assert!(step_text.contains("ISO-10303-21"), "Should be valid ISO STEP format");
         assert!(step_text.contains("PLANE"), "Should contain planar caps");
+    }
+
+    #[test]
+    fn test_sphere_fitting() {
+        let radius = 12.5;
+        let center = Vec3::new(5.0, -3.0, 10.0);
+        let mut points = Vec::new();
+        let mut normals = Vec::new();
+
+        for i in 1..9 {
+            let theta = (i as f64 / 10.0) * std::f64::consts::PI;
+            for j in 0..20 {
+                let phi = (j as f64 / 20.0) * 2.0 * std::f64::consts::PI;
+                let dir = Vec3::new(theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos());
+                let p = center + dir * radius;
+                points.push(p);
+                normals.push(dir);
+            }
+        }
+
+        let fit = fit_sphere(&points, &normals);
+        assert!(fit.is_some(), "fit_sphere should succeed on a spherical patch");
+        if let Some((c, r)) = fit {
+            assert!((r - radius).abs() < 0.1, "Radius should be ~12.5, got {r}");
+            assert!((c - center).len() < 0.1, "Center should be ~{center:?}, got {c:?}");
+        }
     }
 }

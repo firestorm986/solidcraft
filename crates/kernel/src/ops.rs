@@ -446,24 +446,41 @@ fn boolean_whole(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
         Ok(None) => return Ok(None),
         Err(e) => last = format!("{last}; {e}"),
     }
-    // Last resort: nudge the tool by a micron-scale screw motion (turned 2e-6 rad about a
-    // skew axis and moved 2e-6 of the size), which breaks tangencies and seams lying exactly on
-    // the other body. The result moves by no more than that.
+    // Last resort: nudge the tool by a micron-scale screw motion, which breaks tangencies and
+    // seams lying exactly on the other body. Try multiple scales (2e-6, 1e-5, 5e-5).
     if !APART.with(|c| c.get()) {
         APART.with(|c| c.set(true));
         let c = b.solid.vertex_iter().fold(Vec3::ZERO, |acc, v| acc + from_p3(v.point())) * (1.0 / b.solid.vertex_iter().count().max(1) as f64);
-        let r = transform(b, Vec3::new(0.61, -0.37, 0.71) * (size * 2e-6), c, Vec3::new(0.27, 0.83, -0.49), 2e-6).and_then(|nb| boolean(a, &nb, op));
-        APART.with(|c| c.set(false));
-        match r {
-            Ok(Some(body)) => {
-                let (ok, v) = check(&body);
-                if ok {
-                    return Ok(Some(body));
+        for scale in [2e-6, 1e-5, 5e-5] {
+            let r = transform(b, Vec3::new(0.61, -0.37, 0.71) * (size * scale), c, Vec3::new(0.27, 0.83, -0.49), scale)
+                .and_then(|nb| boolean(a, &nb, op));
+            match r {
+                Ok(Some(body)) => {
+                    let (ok, v) = check(&body);
+                    if ok {
+                        APART.with(|c| c.set(false));
+                        return Ok(Some(body));
+                    }
+                    last = format!("{last}; the nudged tool ({scale:.1e}) gave an implausible volume {v:.4}");
                 }
-                last = format!("{last}; the nudged tool gave an implausible volume {v:.4}");
+                Ok(None) => {
+                    APART.with(|c| c.set(false));
+                    return Ok(None);
+                }
+                Err(e) => last = format!("{last}; nudged ({scale:.1e}): {e}"),
             }
-            Ok(None) => return Ok(None),
-            Err(e) => last = format!("{last}; nudged: {e}"),
+        }
+        APART.with(|c| c.set(false));
+    }
+    // If curved surfaces contact at shallow angles where exact B-Rep fallback fails,
+    // use faceted CSG boolean fallback
+    let facet_tol = (size * 1e-3).max(1e-3);
+    if let Ok(mb) = b.tessellate(facet_tol) {
+        if let Ok(Some(body)) = crate::polybool::faceted_boolean(a, &mb, op, facet_tol) {
+            let (ok, _) = check(&body);
+            if ok {
+                return Ok(Some(body));
+            }
         }
     }
     Err(KernelError::Failed(format!("boolean {op:?}: {last}")))

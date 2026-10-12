@@ -286,11 +286,13 @@ fn mesh_to_brep(s: &mut Session, p: &Value) -> Result<Value> {
     let surfaces = solvecraft_kernel::mesh_to_brep::segment_mesh(&tri_mesh, params);
     let mut planar_count = 0;
     let mut cylinder_count = 0;
+    let mut sphere_count = 0;
     let mut unstructured_count = 0;
     for s_surf in &surfaces {
         match s_surf {
             solvecraft_kernel::mesh_to_brep::RecognizedSurface::Planar { .. } => planar_count += 1,
             solvecraft_kernel::mesh_to_brep::RecognizedSurface::Cylindrical { .. } => cylinder_count += 1,
+            solvecraft_kernel::mesh_to_brep::RecognizedSurface::Spherical { .. } => sphere_count += 1,
             solvecraft_kernel::mesh_to_brep::RecognizedSurface::Unstructured { .. } => unstructured_count += 1,
         }
     }
@@ -333,6 +335,7 @@ fn mesh_to_brep(s: &mut Session, p: &Value) -> Result<Value> {
         "name": mesh_name,
         "planar_faces": planar_count,
         "cylinders": cylinder_count,
+        "spheres": sphere_count,
         "unstructured": unstructured_count,
         "feature": feature_id,
         "out": out_step,
